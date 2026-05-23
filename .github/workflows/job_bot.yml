@@ -2,12 +2,13 @@ name: Daily Job Bot
 
 on:
   schedule:
-    - cron: '30 1 * * *'   # 7:00 AM IST (1:30 AM UTC) every day
-  workflow_dispatch:         # Manual trigger from GitHub Actions tab
+    - cron: '30 1 * * *'   # 7:00 AM IST daily
+  workflow_dispatch:         # Manual trigger from Actions tab
 
 jobs:
   run-job-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout code
