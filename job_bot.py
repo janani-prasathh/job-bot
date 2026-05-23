@@ -1,31 +1,54 @@
-import requests
-import smtplib
-import time
-import os
-import re
-import hashlib
-import json
+"""
+AI Job Bot — Janani P
+Scrapes fresher jobs posted in last 48h via Google Jobs (JobSpy),
+tailors each resume with Gemini, generates PDF, emails all attachments.
+
+Deploy: GitHub Actions (free) — runs daily at 7 AM IST
+"""
+
+import smtplib, time, os, re, hashlib, json
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 from datetime import datetime, timezone, timedelta
-from html.parser import HTMLParser
 from io import BytesIO
 
-# ============================================================
-#   CONFIG — Edit this section only
-#   When deploying to GitHub Actions, these come from Secrets
-# ============================================================
+# ── try imports (installed via requirements.txt) ─────────────────────────────
+try:
+    import requests
+except ImportError:
+    raise SystemExit("Run: pip install requests")
 
-YOUR_NAME               = os.environ.get("YOUR_NAME",             "Janani P")
-YOUR_EMAIL              = os.environ.get("YOUR_EMAIL",            "janani.prasath.03@gmail.com")
-YOUR_GMAIL              = os.environ.get("YOUR_GMAIL",            "janani.prasath.03@gmail.com")
-YOUR_GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD",    "xxxx xxxx xxxx xxxx")
-GEMINI_API_KEY          = os.environ.get("GEMINI_API_KEY",        "AIzaSy...")
-JOB_KEYWORDS            = os.environ.get("JOB_KEYWORDS",          "Data Analyst")
-JOB_LOCATION            = os.environ.get("JOB_LOCATION",          "Bengaluru")
-JOBS_TARGET             = 20   # Minimum jobs to collect across all sources
+try:
+    from jobspy import scrape_jobs
+except ImportError:
+    raise SystemExit("Run: pip install python-jobspy")
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+    from reportlab.lib.enums import TA_CENTER
+except ImportError:
+    raise SystemExit("Run: pip install reportlab")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIG  — only edit lines marked ← EDIT
+#  On GitHub Actions these come from Repository Secrets (env vars)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+YOUR_NAME               = os.environ.get("YOUR_NAME",            "Janani P")
+YOUR_EMAIL              = os.environ.get("YOUR_EMAIL",           "janani.prasath.03@gmail.com")
+YOUR_GMAIL              = os.environ.get("YOUR_GMAIL",           "janani.prasath.03@gmail.com")
+YOUR_GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD",   "")   # ← EDIT or set Secret
+GEMINI_API_KEY          = os.environ.get("GEMINI_API_KEY",       "")   # ← EDIT or set Secret
+JOB_KEYWORDS            = os.environ.get("JOB_KEYWORDS",         "Data Analyst")
+JOB_LOCATION            = os.environ.get("JOB_LOCATION",         "Bengaluru, India")
+JOBS_TARGET             = 20
+HOURS_OLD               = 48   # Only jobs posted in last 48 hours
 
 YOUR_BASE_RESUME = """
 JANANI P | janani.prasath.03@gmail.com | +91-9025601507
@@ -96,729 +119,403 @@ Google Data Analytics Professional Certificate
 AI Primer Certification – Infosys Springboard
 """
 
-# ============================================================
-#   HELPER — seen jobs dedup via hash
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DEDUP HELPER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-seen_hashes = set()
-
-def job_hash(title, company):
-    key = f"{title.lower().strip()}|{company.lower().strip()}"
-    return hashlib.md5(key.encode()).hexdigest()
+_seen = set()
 
 def is_duplicate(title, company):
-    h = job_hash(title, company)
-    if h in seen_hashes:
+    h = hashlib.md5(f"{str(title).lower().strip()}|{str(company).lower().strip()}".encode()).hexdigest()
+    if h in _seen:
         return True
-    seen_hashes.add(h)
+    _seen.add(h)
     return False
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FRESHER FILTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+EXPERIENCE_RED_FLAGS = re.compile(
+    r'\b([2-9]|\d{2})\+?\s*years?\b'
+    r'|senior|lead\b|principal|staff engineer|manager|director|head of|vp\b'
+    r'|minimum [2-9]|at least [2-9]|[3-9]\+\s*yrs',
+    re.IGNORECASE
+)
+SENIORITY_IN_TITLE = re.compile(r'\b(senior|lead|principal|staff|manager|director|head)\b', re.IGNORECASE)
+
 def is_fresher_role(title, description=""):
-    """Filter: keep only fresher/entry-level jobs, skip experienced roles."""
-    title_lower = title.lower()
-    desc_lower = description.lower()
-
-    # Must NOT have experience requirements
-    exp_red_flags = [
-        r'\b[2-9]\+?\s*years?\b', r'\b1[0-9]\+?\s*years?\b',
-        'senior', 'lead', 'principal', 'staff engineer', 'manager',
-        'director', 'vp ', 'head of', '5+ yrs', '3+ yrs', '4+ yrs',
-        'minimum 2', 'minimum 3', 'at least 2', 'at least 3'
-    ]
-    for flag in exp_red_flags:
-        if re.search(flag, title_lower) or re.search(flag, desc_lower):
-            return False
-
-    # Prefer fresher/entry-level signals (optional boost, not mandatory filter)
-    fresher_signals = [
-        'fresher', 'entry level', 'entry-level', 'junior', 'graduate',
-        'intern', '0-1 year', '0-2 year', 'trainee', 'associate',
-        'new grad', 'campus', 'recent graduate', 'no experience required'
-    ]
-    # If title has senior/lead explicitly, skip
-    if any(w in title_lower for w in ['senior', 'lead', 'principal', 'staff']):
+    if SENIORITY_IN_TITLE.search(str(title)):
         return False
-
-    return True  # Accept if no red flags found
-
-def within_48_hours(date_str):
-    """Returns True if date_str is within the last 48 hours. Flexible parser."""
-    if not date_str:
-        return True  # Unknown date — include it
-    date_str = date_str.lower().strip()
-    now = datetime.now(timezone.utc)
-
-    # Relative: "2 hours ago", "1 day ago", "just now", "today"
-    if 'just now' in date_str or 'today' in date_str or 'hour' in date_str or 'minute' in date_str:
-        return True
-    if '1 day ago' in date_str or 'yesterday' in date_str:
-        return True
-    if '2 days ago' in date_str:
-        return True
-    # If says "3 days ago" or more — skip
-    match = re.search(r'(\d+)\s*days?\s*ago', date_str)
-    if match and int(match.group(1)) > 2:
+    if EXPERIENCE_RED_FLAGS.search(str(description)):
         return False
-    # Absolute date
-    for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d', '%B %d, %Y', '%b %d, %Y'):
-        try:
-            dt = datetime.strptime(date_str[:19], fmt).replace(tzinfo=timezone.utc)
-            return (now - dt) <= timedelta(hours=48)
-        except:
-            pass
-    return True  # Can't parse — include
+    return True
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SCRAPE — uses JobSpy which routes through Google Jobs (no IP blocking)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ============================================================
-#   SOURCE 1 — LinkedIn
-# ============================================================
+def scrape_all_jobs(keywords, location, target):
+    """
+    Uses python-jobspy which aggregates from multiple sources.
+    Google Jobs and Indeed work reliably from any IP including GitHub Actions.
+    LinkedIn may be blocked — that's OK, Google Jobs covers it indirectly.
+    """
+    print(f"\n--- Scraping jobs: '{keywords}' in '{location}' ---")
+    all_jobs = []
 
-def scrape_linkedin(keywords, location, count=10):
-    print("  [LinkedIn] Scraping...")
-    jobs = []
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    # Search terms to cover freshers broadly
+    search_variants = [
+        f"{keywords} fresher",
+        f"{keywords} entry level",
+        f"{keywords} junior",
+        f"{keywords} trainee",
+        f"junior {keywords}",
+    ]
 
-    # Try multiple start offsets to get more results
-    for start in [0, 10, 20]:
-        if len(jobs) >= count:
+    for term in search_variants:
+        if len(all_jobs) >= target * 2:
             break
         try:
-            url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
-            params = {
-                "keywords": f"{keywords} fresher entry level",
-                "location": location,
-                "f_TPR": "r172800",   # Posted in last 48 hours (172800 seconds)
-                "f_E": "1,2",         # Experience level: Internship(1), Entry(2)
-                "start": start
-            }
-            resp = requests.get(url, params=params, headers=headers, timeout=15)
+            print(f"  Searching: '{term}'")
+            df = scrape_jobs(
+                site_name=["indeed", "linkedin", "google", "glassdoor", "zip_recruiter"],
+                search_term=term,
+                location=location,
+                results_wanted=15,
+                hours_old=HOURS_OLD,
+                country_indeed="India",
+                linkedin_fetch_description=True,   # get full JD for better tailoring
+                verbose=0,
+            )
 
-            class LIParser(HTMLParser):
-                def __init__(self):
-                    super().__init__()
-                    self.jobs = []
-                    self.current = {}
-                    self.capture = None
-                def handle_starttag(self, tag, attrs):
-                    d = dict(attrs)
-                    cls = d.get("class", "")
-                    if tag == "div" and "base-card" in cls:
-                        self.current = {}
-                    if tag == "h3" and "base-search-card__title" in cls:
-                        self.capture = "title"
-                    if tag == "h4" and "base-search-card__subtitle" in cls:
-                        self.capture = "company"
-                    if tag == "span" and "job-search-card__location" in cls:
-                        self.capture = "location"
-                    if tag == "time":
-                        self.current["date"] = d.get("datetime", "")
-                    if tag == "a" and "base-card__full-link" in cls:
-                        self.current["url"] = d.get("href", "")
-                def handle_data(self, data):
-                    if self.capture and data.strip():
-                        self.current[self.capture] = data.strip()
-                        if self.capture == "location":
-                            self.jobs.append(self.current.copy())
-                        self.capture = None
-
-            p = LIParser()
-            p.feed(resp.text)
-            for j in p.jobs:
-                if not j.get("title") or not j.get("company"):
-                    continue
-                if is_duplicate(j["title"], j["company"]):
-                    continue
-                if not within_48_hours(j.get("date", "")):
-                    continue
-                if not is_fresher_role(j["title"]):
-                    continue
-                j["source"] = "LinkedIn"
-                jobs.append(j)
-            time.sleep(1)
-        except Exception as e:
-            print(f"  [LinkedIn] Error: {e}")
-
-    print(f"  [LinkedIn] Got {len(jobs)} jobs")
-    return jobs
-
-
-# ============================================================
-#   SOURCE 2 — Indeed (via RSS feed — no scraping needed)
-# ============================================================
-
-def scrape_indeed(keywords, location, count=10):
-    print("  [Indeed] Scraping via RSS...")
-    jobs = []
-    try:
-        # Indeed public RSS — no API key needed
-        query = f"{keywords} fresher entry level"
-        url = f"https://www.indeed.com/rss?q={requests.utils.quote(query)}&l={requests.utils.quote(location)}&fromage=2&sort=date"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, headers=headers, timeout=15)
-
-        # Parse RSS XML
-        items = re.findall(r'<item>(.*?)</item>', resp.text, re.DOTALL)
-        for item in items[:count]:
-            title  = re.search(r'<title><!\[CDATA\[(.*?)\]\]>', item)
-            comp   = re.search(r'<source[^>]*>(.*?)</source>', item)
-            loc    = re.search(r'<location>(.*?)</location>', item)
-            link   = re.search(r'<link>(.*?)</link>', item)
-            date   = re.search(r'<pubDate>(.*?)</pubDate>', item)
-            desc   = re.search(r'<description><!\[CDATA\[(.*?)\]\]>', item, re.DOTALL)
-
-            title_text = title.group(1).strip() if title else keywords
-            company    = comp.group(1).strip()  if comp  else "Unknown"
-            loc_text   = loc.group(1).strip()   if loc   else location
-            link_text  = link.group(1).strip()  if link  else ""
-            date_text  = date.group(1).strip()  if date  else ""
-            desc_text  = re.sub(r'<[^>]+>', ' ', desc.group(1)) if desc else ""
-
-            if is_duplicate(title_text, company):
-                continue
-            if not within_48_hours(date_text):
-                continue
-            if not is_fresher_role(title_text, desc_text):
+            if df is None or len(df) == 0:
+                print(f"    No results")
                 continue
 
-            jobs.append({
-                "title": title_text,
-                "company": company,
-                "location": loc_text,
-                "url": link_text,
-                "description": desc_text[:500],
-                "date": date_text,
-                "source": "Indeed"
-            })
-    except Exception as e:
-        print(f"  [Indeed] Error: {e}")
+            print(f"    Raw results: {len(df)}")
+            count_added = 0
 
-    print(f"  [Indeed] Got {len(jobs)} jobs")
-    return jobs
+            for _, row in df.iterrows():
+                title   = str(row.get("title", "") or "")
+                company = str(row.get("company", "") or "Unknown")
+                loc     = str(row.get("location", "") or location)
+                url     = str(row.get("job_url", "") or "")
+                desc    = str(row.get("description", "") or "")
+                date    = row.get("date_posted")
+                source  = str(row.get("site", "") or "JobSpy")
 
-
-# ============================================================
-#   SOURCE 3 — Wellfound (AngelList) via public search
-# ============================================================
-
-def scrape_wellfound(keywords, location, count=10):
-    print("  [Wellfound] Scraping...")
-    jobs = []
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml"
-        }
-        query = f"{keywords} entry level"
-        url = f"https://wellfound.com/jobs?q={requests.utils.quote(query)}&l={requests.utils.quote(location)}"
-        resp = requests.get(url, headers=headers, timeout=15)
-
-        # Extract job cards from Wellfound HTML
-        # Wellfound renders some data in JSON inside script tags
-        json_match = re.search(r'"jobListings"\s*:\s*(\[.*?\])\s*[,}]', resp.text, re.DOTALL)
-        if json_match:
-            try:
-                listings = json.loads(json_match.group(1))
-                for j in listings[:count]:
-                    title   = j.get("title", "")
-                    company = j.get("startup", {}).get("name", "Unknown")
-                    loc     = j.get("locationNames", [location])[0] if j.get("locationNames") else location
-                    link    = "https://wellfound.com" + j.get("slug", "")
-                    date    = j.get("createdAt", "")
-
-                    if is_duplicate(title, company):
-                        continue
-                    if not within_48_hours(date):
-                        continue
-                    if not is_fresher_role(title):
-                        continue
-
-                    jobs.append({
-                        "title": title,
-                        "company": company,
-                        "location": loc,
-                        "url": link,
-                        "date": date,
-                        "source": "Wellfound"
-                    })
-            except:
-                pass
-
-        # Fallback: regex extract from HTML
-        if not jobs:
-            titles   = re.findall(r'"title":"([^"]+)"', resp.text)
-            companies = re.findall(r'"name":"([^"]+)"', resp.text)
-            for i, title in enumerate(titles[:count]):
-                company = companies[i] if i < len(companies) else "Startup"
+                # Filters
+                if not title or not company:
+                    continue
                 if is_duplicate(title, company):
                     continue
-                if not is_fresher_role(title):
+                if not is_fresher_role(title, desc):
                     continue
-                jobs.append({
-                    "title": title,
-                    "company": company,
-                    "location": location,
-                    "url": "https://wellfound.com/jobs",
-                    "source": "Wellfound"
+
+                all_jobs.append({
+                    "title":       title,
+                    "company":     company,
+                    "location":    loc,
+                    "url":         url,
+                    "description": desc[:3000],
+                    "date":        str(date) if date else "Recent",
+                    "source":      source.capitalize(),
                 })
-    except Exception as e:
-        print(f"  [Wellfound] Error: {e}")
+                count_added += 1
 
-    print(f"  [Wellfound] Got {len(jobs)} jobs")
-    return jobs
+            print(f"    After filters: +{count_added} (total so far: {len(all_jobs)})")
+            time.sleep(2)   # be polite between searches
 
+        except Exception as e:
+            print(f"    Error on '{term}': {e}")
+            time.sleep(3)
 
-# ============================================================
-#   SOURCE 4 — RemoteOK (great for remote/fresher jobs)
-# ============================================================
-
-def scrape_remoteok(keywords, count=10):
-    print("  [RemoteOK] Scraping via API...")
-    jobs = []
-    try:
-        url = "https://remoteok.com/api"
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-        resp = requests.get(url, headers=headers, timeout=15)
-        data = resp.json()
-
-        keyword_lower = keywords.lower()
-        for item in data:
-            if not isinstance(item, dict) or not item.get("position"):
-                continue
-            title   = item.get("position", "")
-            company = item.get("company", "Unknown")
-            tags    = " ".join(item.get("tags", []))
-            desc    = item.get("description", "")
-            date    = item.get("date", "")
-            link    = item.get("url", "https://remoteok.com")
-
-            # Filter by keyword relevance
-            if keyword_lower not in title.lower() and keyword_lower not in tags.lower():
-                continue
-            if is_duplicate(title, company):
-                continue
-            if not within_48_hours(date):
-                continue
-            if not is_fresher_role(title, desc):
-                continue
-
-            jobs.append({
-                "title": title,
-                "company": company,
-                "location": "Remote",
-                "url": link,
-                "description": re.sub(r'<[^>]+>', ' ', desc)[:500],
-                "date": date,
-                "source": "RemoteOK"
-            })
-            if len(jobs) >= count:
-                break
-    except Exception as e:
-        print(f"  [RemoteOK] Error: {e}")
-
-    print(f"  [RemoteOK] Got {len(jobs)} jobs")
-    return jobs
+    print(f"\nTotal unique fresher jobs collected: {len(all_jobs)}")
+    return all_jobs[:target]
 
 
-# ============================================================
-#   SOURCE 5 — Adzuna (has a free API tier)
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GEMINI RESUME TAILORING
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def scrape_adzuna(keywords, location, count=10):
-    """Adzuna free API — register at developer.adzuna.com for free keys."""
-    print("  [Adzuna] Skipping (add ADZUNA_APP_ID + ADZUNA_API_KEY env vars to enable)")
-    # To enable: register free at developer.adzuna.com, add secrets, uncomment below
-    #
-    # app_id  = os.environ.get("ADZUNA_APP_ID", "")
-    # api_key = os.environ.get("ADZUNA_API_KEY", "")
-    # if not app_id or not api_key:
-    #     return []
-    # url = f"https://api.adzuna.com/v1/api/jobs/in/search/1"
-    # params = {"app_id": app_id, "app_key": api_key, "what": keywords,
-    #           "where": location, "max_days_old": 2, "results_per_page": count,
-    #           "title_only": keywords}
-    # resp = requests.get(url, params=params, timeout=15).json()
-    # for j in resp.get("results", []):
-    #     ... parse and append
-    return []
-
-
-# ============================================================
-#   TAILOR RESUME WITH GEMINI
-# ============================================================
-
-def fetch_job_description(job):
-    """
-    Try to fetch the full job description from the job URL.
-    This is what makes tailoring actually work — without the real JD,
-    Gemini has nothing specific to tailor against.
-    """
-    url = job.get("url", "")
-    # Already have a description from scraping
-    if job.get("description") and len(job["description"]) > 100:
-        return job["description"]
-    if not url or not url.startswith("http"):
-        return ""
-
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        resp = requests.get(url, headers=headers, timeout=12)
-        html = resp.text
-
-        # LinkedIn job description
-        for pattern in [
-            r'class="show-more-less-html__markup[^"]*"[^>]*>(.*?)</div>',
-            r'"description"\s*:\s*\{"text"\s*:\s*"(.*?)"',
-            r'<section[^>]*jobsearch-jobDescriptionText[^>]*>(.*?)</section>',
-            r'id="jobDescriptionText"[^>]*>(.*?)</div>',
-        ]:
-            match = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
-            if match:
-                raw = match.group(1)
-                clean = re.sub(r'<[^>]+>', ' ', raw)
-                clean = re.sub(r'\s+', ' ', clean).strip()
-                if len(clean) > 80:
-                    return clean[:3000]
-
-        # Generic fallback: grab all visible paragraph text
-        paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html, re.DOTALL | re.IGNORECASE)
-        text = ' '.join(re.sub(r'<[^>]+>', '', p) for p in paragraphs)
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text[:3000] if len(text) > 80 else ""
-
-    except Exception as e:
-        print(f"    [desc fetch failed: {e}]")
-        return ""
-
-
-def similarity_ratio(text1, text2):
-    """Rough word-overlap ratio to detect if Gemini actually changed the resume."""
-    words1 = set(text1.lower().split())
-    words2 = set(text2.lower().split())
-    if not words1 or not words2:
+def similarity_ratio(a, b):
+    w1, w2 = set(a.lower().split()), set(b.lower().split())
+    if not w1 or not w2:
         return 1.0
-    overlap = words1 & words2
-    return len(overlap) / max(len(words1), len(words2))
+    return len(w1 & w2) / max(len(w1), len(w2))
 
 
-def tailor_resume_with_gemini(job, base_resume):
-    print(f"  Tailoring for: {job['title']} @ {job['company']}")
-
-    # Step 1: Get the real job description — this is the KEY fix
-    jd = fetch_job_description(job)
-    if not jd:
-        # Build a synthetic JD from whatever we know about the job
-        jd = f"Role: {job['title']} at {job['company']} ({job.get('location','')})."
-        print(f"    [no JD found, using synthetic description]")
-    else:
-        print(f"    [JD fetched: {len(jd)} chars]")
-
-    # Step 2: Build a very explicit prompt
-    prompt = f"""You are a professional resume writer. Your task is to rewrite a candidate's resume so it is SPECIFICALLY tailored to ONE job posting.
-
-=== JOB POSTING ===
-Job Title: {job['title']}
-Company: {job['company']}
-Location: {job.get('location', 'N/A')}
-Job Description:
-{jd}
-
-=== CANDIDATE'S CURRENT RESUME ===
-{base_resume}
-
-=== YOUR TASK ===
-Rewrite the candidate's resume for THIS specific job. The output MUST be different from the input resume.
-
-Mandatory changes you MUST make:
-1. OBJECTIVE section (first section): Write 2-3 sentences specifically mentioning "{job['title']}" and "{job['company']}". This must be unique to this job.
-2. Identify the TOP 5 keywords/skills from the job description. Naturally weave them into the bullet points.
-3. Reorder or reframe project bullet points to highlight what this company cares about most.
-4. SKILLS section: Put the skills most relevant to this JD first.
-5. End with a "WHY I FIT THIS ROLE" section: 3 bullet points that directly reference requirements from the JD above.
-
-Strict rules:
-- Do NOT copy the base resume unchanged
-- Do NOT invent fake experience or skills
-- Output ONLY the resume text — no preamble, no "Here is your resume", no markdown backticks
-- Use plain text with clear section headers in ALL CAPS"""
-
+def call_gemini(prompt, temperature=0.8):
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    )
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.8,       # Higher = more creative rewriting
-            "maxOutputTokens": 2000
-        }
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": 2000},
     }
+    resp = requests.post(url, json=payload, timeout=45)
+    data = resp.json()
+    if "error" in data:
+        raise ValueError(f"Gemini error: {data['error'].get('message', data['error'])}")
+    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+
+def tailor_resume(job, base_resume):
+    title   = job["title"]
+    company = job["company"]
+    jd      = job.get("description", "")
+
+    if not jd or len(jd) < 60:
+        jd = f"Role: {title} at {company} in {job.get('location','')}. Looking for a {title} to join the team."
+
+    print(f"  [{job['source']}] {title} @ {company} | JD: {len(jd)} chars")
+
+    prompt = f"""You are a professional resume writer. Rewrite the candidate's resume to be SPECIFICALLY tailored for this ONE job.
+
+=== JOB POSTING ===
+Title: {title}
+Company: {company}
+Location: {job.get('location', '')}
+Description:
+{jd[:2500]}
+
+=== CANDIDATE RESUME ===
+{base_resume}
+
+=== INSTRUCTIONS ===
+You MUST produce a resume that is noticeably different from the input for THIS specific job.
+
+Required changes (all mandatory):
+1. OBJECTIVE (first section): 2-3 sentences. MUST explicitly name "{title}" and "{company}". Must reference a specific requirement from the JD above.
+2. Extract the 5 most important keywords/skills from the JD. Use each one naturally in at least one bullet point.
+3. Reorder SKILLS section — put JD-relevant skills first.
+4. In PROJECTS, reframe the most relevant project's bullet points to echo the JD language.
+5. Final section "WHY I FIT {company.upper()}": 3 bullet points each directly addressing a specific JD requirement with evidence from the resume.
+
+Formatting rules:
+- Section headers in ALL CAPS
+- Bullet points start with -
+- No markdown, no backticks, no preamble text
+- Output ONLY the resume — start directly with "JANANI P"
+"""
 
     try:
-        resp = requests.post(gemini_url, json=payload, timeout=40)
-        data = resp.json()
+        result = call_gemini(prompt, temperature=0.85)
+        # Strip any accidental markdown fences
+        result = re.sub(r"^```[a-z]*\n?", "", result, flags=re.MULTILINE).replace("```", "").strip()
 
-        # Check for API errors
-        if "error" in data:
-            print(f"    [Gemini API error: {data['error'].get('message', data['error'])}]")
-            return None
+        # Similarity check — if too similar, retry harder
+        sim = similarity_ratio(base_resume, result)
+        if sim > 0.90:
+            print(f"    Similarity {sim:.0%} too high — retrying")
+            prompt += f"\n\nWARNING: Previous attempt was {sim:.0%} identical to input. You MUST rewrite more aggressively. The OBJECTIVE and WHY I FIT sections must be completely new text specific to {company}."
+            result = call_gemini(prompt, temperature=0.95)
+            result = re.sub(r"^```[a-z]*\n?", "", result, flags=re.MULTILINE).replace("```", "").strip()
 
-        tailored = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-        # Strip any markdown code fences Gemini might add despite instructions
-        tailored = re.sub(r'^```[a-z]*\n?', '', tailored, flags=re.MULTILINE)
-        tailored = tailored.replace('```', '').strip()
-
-        # Verify Gemini actually tailored it (similarity check)
-        sim = similarity_ratio(base_resume, tailored)
-        if sim > 0.92:
-            # Output is too similar — retry once with a stronger nudge
-            print(f"    [similarity {sim:.2f} too high, retrying with stronger prompt]")
-            prompt += f"\n\nCRITICAL: The previous output was {sim:.0%} identical to the input. You MUST make more substantial changes. The OBJECTIVE section alone must mention '{job['company']}' and '{job['title']}' explicitly."
-            payload["contents"][0]["parts"][0]["text"] = prompt
-            payload["generationConfig"]["temperature"] = 0.95
-            resp2 = requests.post(gemini_url, json=payload, timeout=40)
-            data2 = resp2.json()
-            if "candidates" in data2:
-                tailored = data2["candidates"][0]["content"]["parts"][0]["text"].strip()
-                tailored = re.sub(r'^```[a-z]*\n?', '', tailored, flags=re.MULTILINE)
-                tailored = tailored.replace('```', '').strip()
-
-        sim_final = similarity_ratio(base_resume, tailored)
-        print(f"    [tailoring done | similarity to base: {sim_final:.0%} | {len(tailored)} chars]")
-        return tailored
+        final_sim = similarity_ratio(base_resume, result)
+        print(f"    Done — similarity to base: {final_sim:.0%}, length: {len(result)} chars")
+        return result
 
     except Exception as e:
-        print(f"    [Gemini exception: {e}]")
+        print(f"    Gemini failed: {e}")
         return None
 
 
-# ============================================================
-#   GENERATE PDF with ReportLab
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PDF GENERATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def generate_resume_pdf(resume_text, job):
-    """Convert resume plain text to a clean PDF. Returns bytes."""
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import mm
-    from reportlab.lib import colors
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
-    from reportlab.lib.enums import TA_LEFT, TA_CENTER
-
+def make_pdf(resume_text, job):
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=A4,
-        leftMargin=15*mm, rightMargin=15*mm,
-        topMargin=12*mm, bottomMargin=12*mm
+        leftMargin=14*mm, rightMargin=14*mm,
+        topMargin=10*mm, bottomMargin=10*mm
     )
 
-    # Styles
-    styles = getSampleStyleSheet()
-    heading_style = ParagraphStyle(
-        'SectionHead', fontSize=10, fontName='Helvetica-Bold',
-        textColor=colors.HexColor('#1a3c6e'), spaceBefore=8, spaceAfter=2
-    )
-    normal_style = ParagraphStyle(
-        'Body', fontSize=9, fontName='Helvetica',
-        leading=13, spaceAfter=2
-    )
-    title_style = ParagraphStyle(
-        'Title', fontSize=14, fontName='Helvetica-Bold',
-        alignment=TA_CENTER, spaceAfter=4,
-        textColor=colors.HexColor('#1a3c6e')
-    )
-    subtitle_style = ParagraphStyle(
-        'Sub', fontSize=8, fontName='Helvetica',
-        alignment=TA_CENTER, spaceAfter=6, textColor=colors.grey
-    )
+    name_style = ParagraphStyle("Name", fontSize=15, fontName="Helvetica-Bold",
+                                 alignment=TA_CENTER, textColor=colors.HexColor("#1a3c6e"),
+                                 spaceAfter=2)
+    sub_style  = ParagraphStyle("Sub", fontSize=8, fontName="Helvetica",
+                                 alignment=TA_CENTER, textColor=colors.grey, spaceAfter=5)
+    head_style = ParagraphStyle("Head", fontSize=10, fontName="Helvetica-Bold",
+                                 textColor=colors.HexColor("#1a3c6e"), spaceBefore=7, spaceAfter=2)
+    body_style = ParagraphStyle("Body", fontSize=8.5, fontName="Helvetica",
+                                 leading=13, spaceAfter=1)
 
     story = []
 
-    # Header
-    story.append(Paragraph(YOUR_NAME, title_style))
+    # Header block
+    story.append(Paragraph(YOUR_NAME, name_style))
     story.append(Paragraph(
-        f"Tailored for: {job['title']} at {job['company']} ({job.get('source','')})",
-        subtitle_style
+        f"Tailored for: <b>{job['title']}</b> at <b>{job['company']}</b> "
+        f"| Source: {job['source']} | {job.get('date','Recent')}",
+        sub_style
     ))
-    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#1a3c6e')))
-    story.append(Spacer(1, 4))
+    story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#1a3c6e")))
+    story.append(Spacer(1, 3))
 
-    # Parse resume text into sections
-    section_keywords = ['OBJECTIVE', 'SUMMARY', 'EDUCATION', 'EXPERIENCE',
-                        'PROJECTS', 'SKILLS', 'CERTIFICATIONS', 'WHY I']
+    SECTION_HEADERS = {
+        "OBJECTIVE", "SUMMARY", "EXPERIENCE", "EDUCATION",
+        "PROJECTS", "SKILLS", "ACHIEVEMENTS", "CERTIFICATIONS",
+        "WHY I FIT"
+    }
 
-    lines = resume_text.strip().split('\n')
-    for line in lines:
+    def safe(text):
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    for line in resume_text.strip().split("\n"):
         line = line.strip()
         if not line:
-            story.append(Spacer(1, 3))
+            story.append(Spacer(1, 2))
             continue
 
-        # Detect section headers
-        is_header = any(line.upper().startswith(kw) for kw in section_keywords)
-        if is_header:
-            story.append(HRFlowable(width="100%", thickness=0.5, color=colors.lightgrey))
-            story.append(Paragraph(line.upper(), heading_style))
-        elif line.startswith('-') or line.startswith('•'):
-            # Bullet point — indent
-            safe_line = line.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            story.append(Paragraph(f"&nbsp;&nbsp;&nbsp;{safe_line}", normal_style))
-        else:
-            safe_line = line.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            story.append(Paragraph(safe_line, normal_style))
+        upper = line.upper()
+        is_section = any(upper.startswith(h) for h in SECTION_HEADERS)
 
-    # Footer
-    story.append(Spacer(1, 6))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.lightgrey))
+        if is_section:
+            story.append(HRFlowable(width="100%", thickness=0.4, color=colors.lightgrey))
+            story.append(Paragraph(line.upper(), head_style))
+        elif line.startswith(("- ", "• ")):
+            story.append(Paragraph(f"&nbsp;&nbsp;&nbsp;{safe(line)}", body_style))
+        else:
+            story.append(Paragraph(safe(line), body_style))
+
+    story.append(Spacer(1, 5))
+    story.append(HRFlowable(width="100%", thickness=0.4, color=colors.lightgrey))
     story.append(Paragraph(
-        f"Generated {datetime.now().strftime('%B %d, %Y')} | Apply at: {job.get('url', 'N/A')}",
-        subtitle_style
+        f"Apply: <a href='{job.get('url','')}'>{job.get('url','N/A')[:80]}</a> "
+        f"| Generated {datetime.now().strftime('%d %b %Y')}",
+        sub_style
     ))
 
     doc.build(story)
     return buffer.getvalue()
 
 
-# ============================================================
-#   SEND EMAIL WITH PDF ATTACHMENTS
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EMAIL
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def send_email(jobs_with_resumes):
-    print(f"\nSending email with {len(jobs_with_resumes)} applications...")
+def send_email(results):
     today = datetime.now().strftime("%B %d, %Y")
-
-    # Count by source
+    n = len(results)
     sources = {}
-    for item in jobs_with_resumes:
-        src = item["job"].get("source", "Other")
-        sources[src] = sources.get(src, 0) + 1
-    source_summary = " | ".join([f"{v} from {k}" for k, v in sources.items()])
+    for item in results:
+        s = item["job"].get("source", "Other")
+        sources[s] = sources.get(s, 0) + 1
+    src_line = " | ".join(f"{v} from {k}" for k, v in sources.items())
 
-    # HTML email body
-    html_body = f"""
-<html>
-<body style="font-family:Arial,sans-serif; max-width:750px; margin:0 auto; padding:20px; color:#1a1a1a;">
-<div style="background:#1a3c6e; padding:20px; border-radius:8px; margin-bottom:20px;">
-  <h1 style="color:white; margin:0;">Your Daily Job Applications</h1>
-  <p style="color:#aac4f0; margin:8px 0 0;">{today} &nbsp;|&nbsp; {len(jobs_with_resumes)} roles found &nbsp;|&nbsp; {source_summary}</p>
+    html = f"""<html><body style="font-family:Arial,sans-serif;max-width:750px;margin:0 auto;padding:20px;">
+<div style="background:#1a3c6e;padding:20px;border-radius:8px;margin-bottom:20px;">
+  <h1 style="color:white;margin:0;">Your Daily Job Applications</h1>
+  <p style="color:#aac4f0;margin:8px 0 0;">{today}&nbsp;|&nbsp;{n} roles&nbsp;|&nbsp;{src_line}</p>
 </div>
 """
-    for i, item in enumerate(jobs_with_resumes, 1):
-        job = item["job"]
-        safe_title = job['title'].replace('&','&amp;')
-        safe_co    = job['company'].replace('&','&amp;')
-        src_color  = {"LinkedIn":"#0077b5","Indeed":"#003a9b","Wellfound":"#fb6404",
-                      "RemoteOK":"#09c372"}.get(job.get("source",""), "#555")
-        html_body += f"""
-<div style="border:1px solid #e0e0e0; border-radius:6px; padding:16px; margin:12px 0;">
-  <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h2 style="margin:0; font-size:15px;">#{i} &mdash; {safe_title}</h2>
-    <span style="background:{src_color}; color:white; padding:2px 8px; border-radius:12px; font-size:11px;">{job.get('source','')}</span>
+    SOURCE_COLORS = {"Indeed":"#003a9b","Linkedin":"#0077b5","Google":"#ea4335",
+                     "Glassdoor":"#0caa41","Zip_recruiter":"#4a90d9"}
+
+    for i, item in enumerate(results, 1):
+        j = item["job"]
+        c = SOURCE_COLORS.get(j.get("source",""), "#555")
+        t = j["title"].replace("&","&amp;")
+        co = j["company"].replace("&","&amp;")
+        fname = f"Resume_{i}_{j['title'][:18].replace(' ','_').replace('/','')}.pdf"
+        html += f"""
+<div style="border:1px solid #e0e0e0;border-radius:6px;padding:14px;margin:10px 0;">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+    <h2 style="margin:0;font-size:14px;">#{i} &mdash; {t}</h2>
+    <span style="background:{c};color:white;padding:2px 8px;border-radius:12px;font-size:11px;white-space:nowrap;">{j.get('source','')}</span>
   </div>
-  <p style="margin:6px 0; color:#555;">
-    <b>Company:</b> {safe_co} &nbsp;&nbsp;
-    <b>Location:</b> {job.get('location','N/A')} &nbsp;&nbsp;
-    <b>Posted:</b> {job.get('date','Recent')}
-  </p>
-  <p style="margin:4px 0;">
-    <a href="{job.get('url','#')}" style="color:#1a3c6e; font-weight:bold;">Apply Now &rarr;</a>
-  </p>
-  <p style="margin:6px 0; font-size:12px; color:#888;">PDF resume attached as: Resume_{i}_{job['title'][:20].replace(' ','_')}.pdf</p>
+  <p style="margin:5px 0;color:#555;font-size:13px;"><b>{co}</b> &nbsp;·&nbsp; {j.get('location','N/A')} &nbsp;·&nbsp; {j.get('date','Recent')}</p>
+  <p style="margin:4px 0;font-size:13px;"><a href="{j.get('url','#')}" style="color:#1a3c6e;font-weight:bold;">Apply Now →</a></p>
+  <p style="margin:4px 0;font-size:11px;color:#888;">📎 Tailored PDF attached: {fname}</p>
 </div>"""
 
-    html_body += """
-<hr style="margin-top:30px;"/>
-<p style="color:#aaa; font-size:11px;">Generated by your AI Job Bot | Ran on GitHub Actions (free)</p>
-</body></html>"""
+    html += "<hr/><p style='color:#aaa;font-size:11px;'>AI Job Bot · GitHub Actions (free)</p></body></html>"
 
-    try:
-        msg = MIMEMultipart("mixed")
-        msg["Subject"] = f"Job Bot: {len(jobs_with_resumes)} Tailored Applications — {today}"
-        msg["From"]    = YOUR_GMAIL
-        msg["To"]      = YOUR_EMAIL
-        msg.attach(MIMEText(html_body, "html"))
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = f"🤖 Job Bot: {n} Tailored Applications — {today}"
+    msg["From"]    = YOUR_GMAIL
+    msg["To"]      = YOUR_EMAIL
+    msg.attach(MIMEText(html, "html"))
 
-        # Attach each resume as PDF
-        for i, item in enumerate(jobs_with_resumes, 1):
-            job = item["job"]
-            print(f"  Generating PDF {i}/{len(jobs_with_resumes)}: {job['title'][:40]}")
-            pdf_bytes = generate_resume_pdf(item["tailored_resume"], job)
-            filename  = f"Resume_{i}_{job['title'][:20].replace(' ','_').replace('/','')}.pdf"
+    for i, item in enumerate(results, 1):
+        j = item["job"]
+        print(f"  Generating PDF {i}/{n}: {j['title'][:45]}")
+        pdf = make_pdf(item["tailored_resume"], j)
+        fname = f"Resume_{i}_{j['title'][:18].replace(' ','_').replace('/','')}.pdf"
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(pdf)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f'attachment; filename="{fname}"')
+        msg.attach(part)
 
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(pdf_bytes)
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
-            msg.attach(part)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(YOUR_GMAIL, YOUR_GMAIL_APP_PASSWORD)
+        s.sendmail(YOUR_GMAIL, YOUR_EMAIL, msg.as_string())
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(YOUR_GMAIL, YOUR_GMAIL_APP_PASSWORD)
-            server.sendmail(YOUR_GMAIL, YOUR_EMAIL, msg.as_string())
-
-        print(f"Email sent to {YOUR_EMAIL} with {len(jobs_with_resumes)} PDF attachments")
-
-    except Exception as e:
-        print(f"Email error: {e}")
-        raise
+    print(f"  Email sent → {YOUR_EMAIL} ({n} PDF attachments)")
 
 
-# ============================================================
-#   MAIN PIPELINE
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def run_job_bot():
-    print(f"\n{'='*55}")
-    print(f"Job Bot Starting — {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"Target: {JOB_KEYWORDS} | {JOB_LOCATION} | Min {JOBS_TARGET} jobs")
-    print(f"{'='*55}\n")
+def run():
+    print("=" * 60)
+    print(f"Job Bot  |  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"Target   :  {JOB_KEYWORDS} in {JOB_LOCATION}")
+    print(f"Filters  :  Last {HOURS_OLD}h | Fresher/Entry-level | Dedup on")
+    print("=" * 60)
 
-    all_jobs = []
+    # Guard: secrets must be set
+    if not GEMINI_API_KEY:
+        raise SystemExit("ERROR: GEMINI_API_KEY is not set. Add it as a GitHub Secret.")
+    if not YOUR_GMAIL_APP_PASSWORD:
+        raise SystemExit("ERROR: GMAIL_APP_PASSWORD is not set. Add it as a GitHub Secret.")
 
-    # Scrape all sources
-    print("--- Collecting jobs from all sources ---")
-    all_jobs += scrape_linkedin(JOB_KEYWORDS, JOB_LOCATION, 10)
-    all_jobs += scrape_indeed(JOB_KEYWORDS, JOB_LOCATION, 10)
-    all_jobs += scrape_wellfound(JOB_KEYWORDS, JOB_LOCATION, 8)
-    all_jobs += scrape_remoteok(JOB_KEYWORDS, 8)
-    all_jobs += scrape_adzuna(JOB_KEYWORDS, JOB_LOCATION, 5)
+    # 1. Scrape
+    jobs = scrape_all_jobs(JOB_KEYWORDS, JOB_LOCATION, JOBS_TARGET)
 
-    print(f"\nTotal collected: {len(all_jobs)} jobs (after dedup + fresher filter + 48h filter)")
+    if not jobs:
+        print("\nNo jobs found after all filters. Possible reasons:")
+        print("  - No fresher roles posted in last 48h for this keyword/location")
+        print("  - Try broadening JOB_KEYWORDS (e.g. 'analyst' instead of 'data analyst')")
+        print("  - Job boards may be temporarily unavailable")
+        print("\nNot sending email — nothing to show.")
+        return   # ← exits cleanly, NO empty email sent
 
-    if not all_jobs:
-        print("No jobs found. Will retry tomorrow.")
-        return
+    print(f"\nFound {len(jobs)} jobs. Proceeding to tailor resumes.")
 
-    # Limit to target count
-    jobs_to_process = all_jobs[:JOBS_TARGET]
-    print(f"Processing {len(jobs_to_process)} jobs...\n")
-
-    # Validate resume is filled in
-    if "REPLACE EVERYTHING BETWEEN" in YOUR_BASE_RESUME or len(YOUR_BASE_RESUME.strip()) < 100:
-        print("\nERROR: You haven't pasted your real resume into YOUR_BASE_RESUME in job_bot.py")
-        print("Open job_bot.py, find YOUR_BASE_RESUME, and replace the placeholder with your actual resume text.")
-        return
-
-    # Tailor resumes
-    print("--- Tailoring resumes with Gemini ---")
+    # 2. Tailor resumes
+    print("\n--- Tailoring resumes with Gemini ---")
     results = []
-    failed = 0
-    for i, job in enumerate(jobs_to_process, 1):
-        print(f"[{i}/{len(jobs_to_process)}]", end=" ")
-        tailored = tailor_resume_with_gemini(job, YOUR_BASE_RESUME)
-        if tailored is None:
+    failed  = 0
+    for i, job in enumerate(jobs, 1):
+        print(f"[{i}/{len(jobs)}]", end=" ")
+        tailored = tailor_resume(job, YOUR_BASE_RESUME)
+        if tailored:
+            results.append({"job": job, "tailored_resume": tailored})
+        else:
             failed += 1
-            print(f"    [skipping job {i} — tailoring failed]")
-            continue
-        results.append({"job": job, "tailored_resume": tailored})
-        time.sleep(1.5)  # Respect Gemini free tier rate limit (15 req/min)
+        time.sleep(1.5)   # Gemini free tier: 15 req/min
 
-    print(f"\nTailored: {len(results)} succeeded, {failed} failed")
+    print(f"\nTailoring complete: {len(results)} succeeded, {failed} failed")
 
-    # Send email with PDF attachments
-    print("\n--- Sending email ---")
+    if not results:
+        print("All tailoring failed — not sending email.")
+        return
+
+    # 3. Send email with PDFs
+    print("\n--- Generating PDFs and sending email ---")
     send_email(results)
 
-    print(f"\nDone! {len(results)} tailored PDF resumes sent to {YOUR_EMAIL}")
-    print("="*55)
+    print(f"\n✓ Done — {len(results)} tailored PDF resumes sent to {YOUR_EMAIL}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    run_job_bot()
+    run()
