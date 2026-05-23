@@ -90,7 +90,4 @@ except Exception as e:
 
 print("\n" + "="*55)
 print("TEST COMPLETE — check results above")
-print("="*55 + "\n")    print("All secrets look OK — proceeding")
-else:
-    print("Fix the above secrets in GitHub → Settings → Secrets and variables → Actions")
-    raise SystemExit(1)
+print("="*55 + "\n")
