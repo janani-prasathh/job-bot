@@ -1,26 +1,24 @@
 import requests
-import json
 import smtplib
-import schedule
 import time
+import os
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
 
 # ============================================================
-#   EDIT ONLY THIS SECTION — YOUR PERSONAL CONFIG
+#   CONFIG — reads from GitHub Secrets (environment variables)
+#   If running locally, hardcode values between the quotes
 # ============================================================
 
-YOUR_NAME = "Janani P"
-YOUR_EMAIL = "itsjananiprasath@gmail.com"           # Gmail you want to receive results
-YOUR_GMAIL = "itsjananiprasath@gmail.com"           # Gmail used to SEND (can be same)
-YOUR_GMAIL_APP_PASSWORD = "yhyj cbeo fcqs sqbu"   # 16-char app password from Step 2
-
-GEMINI_API_KEY = "AIzaSyAxxSNNR06J0Bbt-4sQ4hpbxv_Igp9t6L4"           # From aistudio.google.com
-
-JOB_KEYWORDS = "AI engineer, Data analyst"      # What job you're looking for
-JOB_LOCATION = "Bengaluru"            # Your preferred location
-JOBS_PER_RUN = 5                       # How many jobs to process per day
+YOUR_NAME             = os.environ.get("YOUR_NAME", "Your Name")
+YOUR_EMAIL            = os.environ.get("YOUR_EMAIL", "you@gmail.com")
+YOUR_GMAIL            = os.environ.get("YOUR_GMAIL", "you@gmail.com")
+YOUR_GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "xxxx xxxx xxxx xxxx")
+GEMINI_API_KEY        = os.environ.get("GEMINI_API_KEY", "AIzaSy...")
+JOB_KEYWORDS          = os.environ.get("JOB_KEYWORDS", "Product Manager")
+JOB_LOCATION          = os.environ.get("JOB_LOCATION", "Bengaluru")
+JOBS_PER_RUN          = 5
 
 YOUR_BASE_RESUME = """
 JANANI P | janani.prasath.03@gmail.com | +91-9025601507
@@ -81,40 +79,27 @@ AI Primer Certification – Infosys Springboard
 """
 
 # ============================================================
-#   DO NOT EDIT BELOW THIS LINE
+#   SCRAPE LINKEDIN JOBS
 # ============================================================
 
 def scrape_linkedin_jobs(keywords, location, count=5):
-    """Scrape jobs from LinkedIn's guest API — no account needed."""
-    print(f"🔍 Scraping LinkedIn for: {keywords} in {location}")
+    print(f"Scraping LinkedIn for: {keywords} in {location}")
     jobs = []
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
-    params = {
-        "keywords": keywords,
-        "location": location,
-        "start": 0,
-        "count": count
-    }
-    
+    params = {"keywords": keywords, "location": location, "start": 0}
+
     try:
         response = requests.get(url, params=params, headers=headers, timeout=15)
-        
-        # Parse the HTML response to extract job info
         from html.parser import HTMLParser
-        
+
         class JobParser(HTMLParser):
             def __init__(self):
                 super().__init__()
                 self.jobs = []
                 self.current_job = {}
                 self.capture = None
-                self.depth = 0
-            
+
             def handle_starttag(self, tag, attrs):
                 attrs_dict = dict(attrs)
                 if tag == "div" and "base-card" in attrs_dict.get("class", ""):
@@ -127,218 +112,146 @@ def scrape_linkedin_jobs(keywords, location, count=5):
                     self.capture = "location"
                 if tag == "a" and "base-card__full-link" in attrs_dict.get("class", ""):
                     self.current_job["url"] = attrs_dict.get("href", "")
-            
+
             def handle_data(self, data):
                 if self.capture and data.strip():
                     self.current_job[self.capture] = data.strip()
                     if self.capture == "location" and self.current_job.get("title"):
                         self.jobs.append(self.current_job.copy())
                     self.capture = None
-        
+
         parser = JobParser()
         parser.feed(response.text)
         jobs = parser.jobs[:count]
-        
+
         if not jobs:
-            # Fallback: return sample jobs for testing
-            print("⚠️  LinkedIn returned no results, using test data")
-            jobs = [
-                {
-                    "title": f"{keywords} - Sample Role",
-                    "company": "Sample Company",
-                    "location": location,
-                    "url": "https://linkedin.com/jobs",
-                    "description": f"We are looking for a {keywords} to join our team. You will be responsible for product strategy, roadmap planning, and working with cross-functional teams."
-                }
-            ]
-        
-        print(f"✅ Found {len(jobs)} jobs")
+            print("LinkedIn returned no results, using fallback test data")
+            jobs = [{"title": keywords, "company": "Test Company", "location": location,
+                     "url": "https://linkedin.com/jobs",
+                     "description": f"Looking for a {keywords} to join our growing team."}]
+
+        print(f"Found {len(jobs)} jobs")
         return jobs
-        
+
     except Exception as e:
-        print(f"❌ Scraping error: {e}")
+        print(f"Scraping error: {e}")
         return []
 
 
-def get_job_description(job_url):
-    """Fetch the full job description from the job URL."""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        response = requests.get(job_url, headers=headers, timeout=10)
-        
-        # Extract description text from LinkedIn job page
-        text = response.text
-        start = text.find("show-more-less-html__markup")
-        if start != -1:
-            start = text.find(">", start) + 1
-            end = text.find("</div>", start)
-            raw = text[start:end]
-            # Strip HTML tags simply
-            import re
-            clean = re.sub(r'<[^>]+>', ' ', raw).strip()
-            return clean[:2000]  # Limit to 2000 chars
-        return "No description available"
-    except:
-        return "Could not fetch job description"
-
+# ============================================================
+#   TAILOR RESUME WITH GEMINI (FREE)
+# ============================================================
 
 def tailor_resume_with_gemini(job, base_resume):
-    """Use Google Gemini (free) to tailor the resume for this specific job."""
-    print(f"🤖 Tailoring resume for: {job['title']} at {job['company']}")
-    
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-    
-    prompt = f"""You are an expert resume writer and career coach.
+    print(f"Tailoring resume for: {job['title']} at {job['company']}")
 
-JOB DETAILS:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+
+    prompt = f"""You are an expert resume writer.
+
+JOB:
 Title: {job['title']}
 Company: {job['company']}
 Location: {job.get('location', 'N/A')}
-Description: {job.get('description', 'Not available')}
+Description: {job.get('description', 'Not provided')}
 
-CANDIDATE'S BASE RESUME:
+CANDIDATE RESUME:
 {base_resume}
 
-TASK:
-Rewrite the resume to be highly tailored for THIS specific job. 
-
-Rules:
-1. Use keywords from the job description naturally
-2. Reorder/reframe bullet points to match what this company values
-3. Keep the same factual experience — don't invent anything
-4. Add a 2-line tailored summary at the top for this specific role
-5. Keep it clean and readable
-6. At the end, add a section called "WHY THIS ROLE FITS" with 3 bullet points explaining why the candidate is a strong match
-
-Output ONLY the tailored resume text. No extra commentary."""
+Rewrite the resume tailored for this specific job. Use keywords from the job description.
+Keep all facts true — do not invent anything. Add a 2-line tailored summary at the top.
+At the end, add "WHY THIS ROLE FITS" with 3 bullet points.
+Output ONLY the resume text, nothing else."""
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1500}
     }
-    
+
     try:
         response = requests.post(url, json=payload, timeout=30)
         data = response.json()
         tailored = data["candidates"][0]["content"]["parts"][0]["text"]
-        print(f"✅ Resume tailored successfully")
+        print("Resume tailored successfully")
         return tailored
     except Exception as e:
-        print(f"❌ Gemini error: {e}")
-        return base_resume  # Fall back to original resume
+        print(f"Gemini error: {e}")
+        return base_resume
 
+
+# ============================================================
+#   SEND EMAIL
+# ============================================================
 
 def send_email(jobs_with_resumes):
-    """Send all tailored applications to your email."""
-    print(f"📧 Sending email with {len(jobs_with_resumes)} applications...")
-    
+    print(f"Sending email with {len(jobs_with_resumes)} applications...")
     today = datetime.now().strftime("%B %d, %Y")
-    
-    # Build HTML email body
+
     html_body = f"""
     <html>
     <body style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px;">
-    
-    <h1 style="color: #2d5be3;">🤖 Your Daily Job Applications</h1>
-    <p style="color: #666;">Generated on {today} | {len(jobs_with_resumes)} roles found for <b>{JOB_KEYWORDS}</b> in <b>{JOB_LOCATION}</b></p>
+    <h1 style="color: #2d5be3;">Your Daily Job Applications</h1>
+    <p style="color: #666;">{today} | {len(jobs_with_resumes)} roles for <b>{JOB_KEYWORDS}</b> in <b>{JOB_LOCATION}</b></p>
     <hr/>
     """
-    
+
     for i, item in enumerate(jobs_with_resumes, 1):
         job = item["job"]
         resume = item["tailored_resume"]
-        
         html_body += f"""
-        <div style="background: #f9f9f9; border-left: 4px solid #2d5be3; padding: 20px; margin: 20px 0; border-radius: 4px;">
-            <h2 style="color: #1a1a1a; margin-top: 0;">#{i} — {job['title']}</h2>
-            <p><b>🏢 Company:</b> {job['company']}</p>
-            <p><b>📍 Location:</b> {job.get('location', 'N/A')}</p>
-            <p><b>🔗 Apply here:</b> <a href="{job.get('url', '#')}">{job.get('url', 'N/A')}</a></p>
-            
+        <div style="background:#f9f9f9; border-left:4px solid #2d5be3; padding:20px; margin:20px 0; border-radius:4px;">
+            <h2 style="margin-top:0;">#{i} — {job['title']}</h2>
+            <p><b>Company:</b> {job['company']}</p>
+            <p><b>Location:</b> {job.get('location','N/A')}</p>
+            <p><b>Apply:</b> <a href="{job.get('url','#')}">{job.get('url','N/A')}</a></p>
             <details>
-                <summary style="cursor: pointer; color: #2d5be3; font-weight: bold; margin-top: 15px;">
-                    📄 Click to view your tailored resume for this role
-                </summary>
-                <pre style="background: white; padding: 15px; border: 1px solid #ddd; border-radius: 4px; white-space: pre-wrap; font-size: 13px; margin-top: 10px;">{resume}</pre>
+                <summary style="cursor:pointer; color:#2d5be3; font-weight:bold;">Click to view tailored resume</summary>
+                <pre style="background:white; padding:15px; border:1px solid #ddd; white-space:pre-wrap; font-size:13px;">{resume}</pre>
             </details>
         </div>
         """
-    
-    html_body += """
-    <hr/>
-    <p style="color: #999; font-size: 12px;">Generated by your AI Job Bot 🤖 | Running 24/7 on Render.com</p>
-    </body>
-    </html>
-    """
-    
-    # Send via Gmail SMTP
+
+    html_body += "<hr/><p style='color:#999; font-size:12px;'>Your AI Job Bot</p></body></html>"
+
     try:
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"🤖 {len(jobs_with_resumes)} Tailored Applications Ready — {today}"
+        msg["Subject"] = f"{len(jobs_with_resumes)} Tailored Applications Ready — {today}"
         msg["From"] = YOUR_GMAIL
         msg["To"] = YOUR_EMAIL
-        
         msg.attach(MIMEText(html_body, "html"))
-        
+
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(YOUR_GMAIL, YOUR_GMAIL_APP_PASSWORD)
             server.sendmail(YOUR_GMAIL, YOUR_EMAIL, msg.as_string())
-        
-        print(f"✅ Email sent successfully to {YOUR_EMAIL}")
-        
-    except Exception as e:
-        print(f"❌ Email error: {e}")
 
+        print(f"Email sent to {YOUR_EMAIL}")
+    except Exception as e:
+        print(f"Email error: {e}")
+
+
+# ============================================================
+#   MAIN
+# ============================================================
 
 def run_job_bot():
-    """Main function — runs the full pipeline."""
     print(f"\n{'='*50}")
-    print(f"🚀 Job Bot Starting — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"Job Bot Starting — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*50}")
-    
-    # Step 1: Scrape jobs
+
     jobs = scrape_linkedin_jobs(JOB_KEYWORDS, JOB_LOCATION, JOBS_PER_RUN)
-    
     if not jobs:
-        print("No jobs found today. Will try again tomorrow.")
+        print("No jobs found today.")
         return
-    
-    # Step 2: For each job, get description + tailor resume
+
     results = []
     for job in jobs:
-        # Try to get full job description
-        if job.get("url") and job["url"].startswith("http"):
-            job["description"] = get_job_description(job["url"])
-        
-        # Tailor resume with Gemini
         tailored = tailor_resume_with_gemini(job, YOUR_BASE_RESUME)
         results.append({"job": job, "tailored_resume": tailored})
-        
-        time.sleep(2)  # Be polite to APIs
-    
-    # Step 3: Send email
+        time.sleep(2)
+
     send_email(results)
-    
-    print(f"\n✅ Done! Processed {len(results)} jobs.")
+    print(f"\nDone! Processed {len(results)} jobs.")
 
-
-# ============================================================
-#   SCHEDULER — Runs every day at 7:00 AM
-# ============================================================
 
 if __name__ == "__main__":
-    print("🤖 Job Bot is running...")
-    print(f"   Looking for: {JOB_KEYWORDS} in {JOB_LOCATION}")
-    print(f"   Will email: {YOUR_EMAIL}")
-    print(f"   Scheduled: Every day at 07:00 AM")
-    print()
-    
-    # Run once immediately on startup (for testing)
     run_job_bot()
-    
-    # Then schedule daily at 7am
-    schedule.every().day.at("07:00").do(run_job_bot)
-    
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
