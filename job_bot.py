@@ -41,8 +41,8 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 YOUR_NAME               = os.environ.get("YOUR_NAME",            "Janani P")
-YOUR_EMAIL              = os.environ.get("YOUR_EMAIL",           "janani.prasath.03@gmail.com")
-YOUR_GMAIL              = os.environ.get("YOUR_GMAIL",           "janani.prasath.03@gmail.com")
+YOUR_EMAIL              = os.environ.get("YOUR_EMAIL",           "itsjananiprasath@gmail.com")
+YOUR_GMAIL              = os.environ.get("YOUR_GMAIL",           "itsjananiprasath@gmail.com")
 YOUR_GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD",   "")   # ← EDIT or set Secret
 GEMINI_API_KEY          = os.environ.get("GEMINI_API_KEY",       "")   # ← EDIT or set Secret
 JOB_KEYWORDS            = os.environ.get("JOB_KEYWORDS",         "Data Analyst")
