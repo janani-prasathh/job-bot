@@ -48,7 +48,7 @@ GEMINI_API_KEY          = os.environ.get("GEMINI_API_KEY",       "")   # ← EDI
 JOB_KEYWORDS            = os.environ.get("JOB_KEYWORDS",         "Data Analyst")
 JOB_LOCATION            = os.environ.get("JOB_LOCATION",         "Bengaluru, India")
 JOBS_TARGET             = 20
-HOURS_OLD               = 48   # Only jobs posted in last 48 hours
+HOURS_OLD               = 72   # Jobs posted in last 72 hours (was 48, relaxed)
 
 YOUR_BASE_RESUME = """
 JANANI P | janani.prasath.03@gmail.com | +91-9025601507
@@ -164,13 +164,15 @@ def scrape_all_jobs(keywords, location, target):
     print(f"\n--- Scraping jobs: '{keywords}' in '{location}' ---")
     all_jobs = []
 
-    # Search terms to cover freshers broadly
+    # Search terms: fresher-specific first, then broader fallbacks
     search_variants = [
         f"{keywords} fresher",
         f"{keywords} entry level",
-        f"{keywords} junior",
-        f"{keywords} trainee",
         f"junior {keywords}",
+        f"{keywords} trainee",
+        f"{keywords} 0 years experience",
+        f"{keywords}",               # broad fallback — no fresher filter in query
+        f"{keywords} graduate",
     ]
 
     for term in search_variants:
@@ -185,7 +187,7 @@ def scrape_all_jobs(keywords, location, target):
                 results_wanted=15,
                 hours_old=HOURS_OLD,
                 country_indeed="India",
-                linkedin_fetch_description=True,   # get full JD for better tailoring
+                linkedin_fetch_description=True,
                 verbose=0,
             )
 
@@ -210,7 +212,8 @@ def scrape_all_jobs(keywords, location, target):
                     continue
                 if is_duplicate(title, company):
                     continue
-                if not is_fresher_role(title, desc):
+                # Only apply fresher filter on title — description filter was too aggressive
+                if SENIORITY_IN_TITLE.search(title):
                     continue
 
                 all_jobs.append({
@@ -225,7 +228,7 @@ def scrape_all_jobs(keywords, location, target):
                 count_added += 1
 
             print(f"    After filters: +{count_added} (total so far: {len(all_jobs)})")
-            time.sleep(2)   # be polite between searches
+            time.sleep(2)
 
         except Exception as e:
             print(f"    Error on '{term}': {e}")
@@ -399,6 +402,40 @@ def make_pdf(resume_text, job):
 #  EMAIL
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _send_no_jobs_email():
+    """Send a simple notification when no jobs are found so you know the bot ran."""
+    today = datetime.now().strftime("%B %d, %Y")
+    html = f"""<html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+<div style="background:#1a3c6e;padding:20px;border-radius:8px;">
+  <h2 style="color:white;margin:0;">Job Bot Ran — No New Jobs Today</h2>
+  <p style="color:#aac4f0;margin:8px 0 0;">{today}</p>
+</div>
+<div style="padding:20px;border:1px solid #e0e0e0;border-radius:8px;margin-top:16px;">
+  <p>The bot ran successfully but found <b>0 jobs</b> matching your filters:</p>
+  <ul>
+    <li>Keywords: <b>{JOB_KEYWORDS}</b></li>
+    <li>Location: <b>{JOB_LOCATION}</b></li>
+    <li>Posted in last: <b>{HOURS_OLD} hours</b></li>
+    <li>Level: <b>Fresher / Entry-level only</b></li>
+  </ul>
+  <p>This can happen on days when few new jobs are posted. Try again tomorrow.</p>
+  <p>To get more results, update <b>JOB_KEYWORDS</b> in GitHub Secrets to a broader term like <b>analyst</b> or <b>engineer</b>.</p>
+</div>
+</body></html>"""
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"Job Bot: No jobs found today — {today}"
+        msg["From"]    = YOUR_GMAIL
+        msg["To"]      = YOUR_EMAIL
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(YOUR_GMAIL, YOUR_GMAIL_APP_PASSWORD)
+            s.sendmail(YOUR_GMAIL, YOUR_EMAIL, msg.as_string())
+        print(f"  Notification email sent to {YOUR_EMAIL}")
+    except Exception as e:
+        print(f"  Could not send notification email: {e}")
+
+
 def send_email(results):
     today = datetime.now().strftime("%B %d, %Y")
     n = len(results)
@@ -514,12 +551,11 @@ def run():
     jobs = scrape_all_jobs(JOB_KEYWORDS, JOB_LOCATION, JOBS_TARGET)
 
     if not jobs:
-        print("\nNo jobs found after all filters. Possible reasons:")
-        print("  - No fresher roles posted in last 48h for this keyword/location")
-        print("  - Try broadening JOB_KEYWORDS (e.g. 'analyst' instead of 'data analyst')")
-        print("  - Job boards may be temporarily unavailable")
-        print("\nNot sending email — nothing to show.")
-        return   # ← exits cleanly, NO empty email sent
+        print("\nNo jobs found after all filters.")
+        print("Sending notification email so you know the bot ran.")
+        # Send a notification email so you always get something
+        _send_no_jobs_email()
+        return
 
     print(f"\nFound {len(jobs)} jobs. Proceeding to tailor resumes.")
 
